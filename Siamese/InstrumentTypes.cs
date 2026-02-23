@@ -1,0 +1,33 @@
+﻿namespace JLcLib.Custom
+{
+    public enum InstrumentTypes
+    {
+        SpectrumAnalyzer,
+        SignalGenerator0,
+        SignalGenerator1,
+        SignalGenerator2,
+        OscilloScope0,
+        OscilloScope1,
+        PowerSupply0,
+        PowerSupply1,
+        PowerSupply2,
+        PowerSupply3,
+        ElectronicLoad,
+        BatterySimulator,
+        TempChamber,
+        DigitalMultimeter0,
+        DigitalMultimeter1,
+        DigitalMultimeter2,
+        DigitalMultimeter3,
+        DigitalMultimeter4,
+        DigitalMultimeter5,
+        DigitalMultimeter6,
+        DigitalMultimeter7,
+        DigitalMultimeter8,
+        DigitalMultimeter9,
+        NoiseFigure,
+        WaveformGenerator,
+        SourceAnalyzer,
+        NumInsTypes
+    }
+}

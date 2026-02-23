@@ -1,0 +1,2155 @@
+﻿using JLcLib.Chip;
+using JLcLib.Comn;
+using JLcLib.Custom;
+using SKAIChips_Verification;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Drawing;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace SKAI_SPI
+{
+    public class Lyon : ChipControl
+    {
+        #region Variable and declaration
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 수동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_MANUAL
+        {
+            JUWON,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 자동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_AUTO
+        {
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// 현재 선택된 테스트 모드(수동/자동)를 관리하기 위한 열거형입니다.
+        /// </summary>
+        public enum COMBOBOX_ITEMS
+        {
+            MANUAL,
+            AUTO,
+        }
+
+        // SPI 통신을 위한 인터페이스 객체. 부모 폼(RegContForm)으로부터 전달받습니다.
+        private JLcLib.Custom.SPI SPI = null;
+
+        // UART 통신을 위한 시리얼 포트 객체. 칩의 디버그 메시지 등을 수신하는 데 사용됩니다.
+        private JLcLib.Comn.Serial Serial { get; set; } = new JLcLib.Comn.Serial();
+
+        // 시리얼 데이터 수신 여부를 나타내는 플래그. 비동기 이벤트 처리에 사용됩니다.
+        private bool IsSerialReceivedData = false;
+        private bool IsRunCal = false;
+
+        /* * 외부 계측 장비 제어를 위한 SCPI(Standard Commands for Programmable Instruments) 객체들입니다.
+         * 자동화된 테스트 환경에서 전원 공급기, 멀티미터, 오실로스코프 등을 제어할 때 사용됩니다.
+         */
+        JLcLib.Instrument.SCPI PowerSupply0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter1 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter2 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter3 = null;
+        JLcLib.Instrument.SCPI OscilloScope0 = null;
+        JLcLib.Instrument.SCPI SpectrumAnalyzer = null;
+        JLcLib.Instrument.SCPI TempChamber = null;
+
+        // 현재 UI에 선택된 테스트 모드(MANUAL 또는 AUTO)를 저장하는 변수입니다.
+        private COMBOBOX_ITEMS CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+
+        #endregion Variable and declaration
+
+        /// <summary>
+        /// Lyon 클래스의 생성자입니다.
+        /// RegContForm으로부터 제어에 필요한 객체와 설정을 전달받아 초기화합니다.
+        /// </summary>
+        /// <param name="form">메인 UI 폼 객체</param>
+        public Lyon(RegContForm form) : base(form)
+        {
+            // 부모 폼의 SPI 객체를 이 클래스에서 사용할 수 있도록 할당합니다.
+            SPI = Parent.SPI;
+
+            // 설정 파일(.ini)에서 "Lyon" 섹션의 시리얼 포트 설정을 읽어옵니다.
+            Serial.ReadSettingFile(form.IniFile, "Lyon");
+
+            // 시리얼 데이터가 수신될 때마다 Serial_DataReceived 메서드가 호출되도록 이벤트 핸들러를 등록합니다.
+            Serial.DataReceived += Serial_DataReceived;
+
+            // 칩의 캘리브레이션 데이터를 저장할 바이트 배열을 초기화합니다.
+            CalibrationData = new byte[256];
+
+            /* UI의 테스트 항목 콤보박스를 초기화합니다. */
+            // 기본적으로 수동(MANUAL) 테스트 목록을 채워 넣습니다.
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0; // 첫 번째 항목을 기본값으로 선택
+        }
+
+        /// <summary>
+        /// 시리얼 포트로부터 데이터가 수신될 때 호출되는 이벤트 핸들러입니다.
+        /// </summary>
+        private void Serial_DataReceived(object sender, JLcLib.Comn.RcvEventArgs e)
+        {
+            // 데이터가 수신되었음을 플래그로 표시합니다.
+            IsSerialReceivedData = true;
+        }
+
+        /// <summary>
+        /// Lyon 칩의 특정 주소에 16비트 데이터를 쓰는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">쓰기를 수행할 7비트 레지스터 주소</param>
+        /// <param name="Data">쓸 16비트 데이터</param>
+        private void WriteRegister(uint Address, uint Data)
+        {
+            // SPI 통신을 위한 3바이트 패킷을 생성합니다.
+            byte[] Bytes = new byte[3];
+            byte rwFlag = 1; // 쓰기 동작을 의미하는 플래그 (0b1)
+
+            // Byte 0: [R/W 플래그(1bit)] + [주소(7bit)]
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+            // Byte 1: 데이터의 상위 8비트
+            Bytes[1] = (byte)((Data >> 8) & 0xff);
+            // Byte 2: 데이터의 하위 8비트
+            Bytes[2] = (byte)((Data >> 0) & 0xff);
+
+            // 구성된 3바이트 패킷을 SPI 버스를 통해 전송합니다.
+            SPI.WriteBytes(Bytes, 3, true);
+        }
+
+        /// <summary>
+        /// Lyon 칩의 특정 주소에서 16비트 데이터를 읽어오는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">읽기를 수행할 7비트 레지스터 주소</param>
+        /// <returns>읽어온 16비트 데이터</returns>
+        private uint ReadRegister(uint Address)
+        {
+            byte rwFlag = 0; // 읽기 동작을 의미하는 플래그 (0b0)
+            uint Data = 0xFFFF; // 읽기 실패 시 반환될 기본값
+
+            // 칩에 보낼 1바이트 주소 패킷
+            byte[] Bytes = new byte[1];
+            // 칩으로부터 받을 2바이트 데이터 버퍼
+            byte[] Buff = new byte[2];
+
+            // Byte 0: [R/W 플래그(1bit)] + [주소(7bit)]
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+
+            // 1바이트를 보내고 동시에 2바이트를 읽어옵니다.
+            Buff = SPI.WriteAndReadBytes(Bytes, 1, 2);
+
+            // 수신된 2바이트를 하나의 16비트 uint 데이터로 조합합니다.
+            Data = (uint)((Buff[0] << 8) | (Buff[1] << 0));
+
+            return Data;
+        }
+
+        /// <summary>
+        /// Excel 파일에서 읽어온 2차원 배열 데이터를 파싱하여
+        /// 애플리케이션에서 사용할 수 있는 RegisterGroup 객체로 변환합니다.
+        /// </summary>
+        /// <param name="GroupName">레지스터 그룹 이름 (Excel 시트 이름)</param>
+        /// <param name="RegData">Excel에서 읽어온 원본 데이터</param>
+        /// <returns>파싱된 RegisterGroup 객체</returns>
+        public override JLcLib.Chip.RegisterGroup MakeRegisterGroup(string GroupName, string[,] RegData)
+        {
+            // 이 그룹의 모든 레지스터가 공통으로 사용할 Read/Write 함수를 지정하여 객체를 생성합니다.
+            JLcLib.Chip.RegisterGroup rg = new JLcLib.Chip.RegisterGroup(GroupName, WriteRegister, ReadRegister);
+
+            // Excel 시트의 특정 패턴을 찾아 레지스터 정보를 추출합니다.
+            for (int xStart = 0; xStart < 3; xStart++)
+            {
+                for (int Row = 0; Row < RegData.GetLength(0); Row++)
+                {
+                    // "Bit", "Name", "Default" 키워드가 연속으로 나타나는 행을 레지스터의 시작점으로 간주합니다.
+                    if ((RegData[Row, xStart] == "Bit") && (RegData[Row + 1, xStart] == "Name") && (RegData[Row + 2, xStart] == "Default"))
+                    {
+                        string RegName = null;
+                        uint Address = 0;
+
+                        // 레지스터 이름과 주소를 추출합니다. (키워드 바로 윗 행에 위치)
+                        string StrAddr = RegData[Row - 1, xStart + 1];
+                        if (StrAddr.StartsWith("0x"))
+                            StrAddr = StrAddr.Substring(2);
+                        Address = uint.Parse(StrAddr, System.Globalization.NumberStyles.HexNumber);
+                        RegName = RegData[Row - 1, xStart + 2];
+
+                        // 추출한 정보로 Register 객체를 생성하고 그룹에 추가합니다.
+                        JLcLib.Chip.Register reg = rg.Registers.Add(RegName, Address);
+
+                        // 레지스터에 속한 개별 비트 필드(RegisterItem) 정보를 파싱합니다.
+                        for (int Column = xStart + 1; Column < RegData.GetLength(1); Column++)
+                        {
+                            // 유효한 비트 필드인지 확인합니다.
+                            if (!((RegData[Row + 2, Column] == "X") || (RegData[Row + 2, Column] == "-") || (RegData[Row + 2, Column] == null) || (RegData[Row + 1, Column] == null)))
+                            {
+                                string ItemName = null, ItemDesc = null;
+                                int UpperBit = 0, LowerBit = 0;
+                                uint ItemValue = 0;
+
+                                // 이름, 비트 위치, 기본값을 추출합니다.
+                                ItemName = RegData[Row + 1, Column];
+                                UpperBit = int.Parse(RegData[Row, Column]);
+                                LowerBit = int.Parse(RegData[Row, Column]);
+                                ItemValue = (uint)((RegData[Row + 2, Column] == "0") ? 0 : 1);
+
+                                // 여러 비트에 걸친 필드인 경우, LowerBit와 ItemValue를 계속 파싱합니다.
+                                for (int x = Column + 1; x < RegData.GetLength(1); x++)
+                                {
+                                    if (RegData[Row + 1, x] == null) // 이름이 비어있으면 같은 필드에 속한 것으로 간주
+                                    {
+                                        if (RegData[Row, x] != null)
+                                        {
+                                            LowerBit = int.Parse(RegData[Row, x]);
+                                            ItemValue = (ItemValue << 1) | (uint)((RegData[Row + 2, x] == "0") ? 0 : 1);
+                                        }
+                                    }
+                                    else break;
+                                }
+
+                                // 비트 필드에 대한 상세 설명을 파싱합니다.
+                                for (int y = Row; y < RegData.GetLength(0); y++)
+                                {
+                                    if (RegData[y, xStart] == ItemName)
+                                    {
+                                        ItemDesc = RegData[y, xStart + 1];
+                                        // ... (상세 설명 파싱 로직)
+                                    }
+                                }
+                                // 최종적으로 파싱된 정보로 RegisterItem 객체를 생성하고 레지스터에 추가합니다.
+                                reg.Items.Add(ItemName, UpperBit, LowerBit, ItemValue, ItemDesc);
+                            }
+                        }
+                    }
+                }
+            }
+            return rg;
+        }
+
+        /// <summary>
+        /// 메인 UI의 "Chip Specific Control" 그룹 박스를 Lyon 칩에 맞게 설정합니다.
+        /// </summary>
+        public override void SetChipSpecificUI()
+        {
+            /*
+             * 버튼과 텍스트 박스는 0~11번까지의 인덱스를 가집니다.
+             * 이 인덱스를 사용하여 특정 위치의 컨트롤을 활성화하고 기능을 할당합니다.
+             */
+            Parent.ChipCtrlTextboxes[0].ReadOnly = true;
+            Parent.ChipCtrlTextboxes[0].Visible = true;
+            Parent.ChipCtrlTextboxes[0].Text = Serial.Config.PortName;
+            Parent.ChipCtrlTextboxes[0].Size = new System.Drawing.Size(Parent.ChipCtrlTextboxes[0].Size.Width * 2 + 3, Parent.ChipCtrlTextboxes[0].Size.Height);
+
+            Parent.ChipCtrlButtons[2].Text = "Connect";
+            Parent.ChipCtrlButtons[2].Visible = true;
+            Parent.ChipCtrlButtons[2].Click += SerialConnect_Click; // 시리얼 연결 버튼 이벤트 할당
+
+            Parent.ChipCtrlButtons[3].Text = "Set UART";
+            Parent.ChipCtrlButtons[3].Visible = true;
+            Parent.ChipCtrlButtons[3].Click += SerialSetting_Click; // 시리얼 설정 버튼 이벤트 할당
+
+            Parent.ChipCtrlButtons[8].Text = "Manual";
+            Parent.ChipCtrlButtons[8].Visible = true;
+            Parent.ChipCtrlButtons[8].Click += Change_To_Manual_Test_Items; // 수동 테스트 모드 전환 버튼
+
+            Parent.ChipCtrlButtons[9].Text = "AUTO";
+            Parent.ChipCtrlButtons[9].Visible = true;
+            Parent.ChipCtrlButtons[9].Click += Change_To_Auto_Test_Items; // 자동 테스트 모드 전환 버튼
+        }
+
+        /// <summary>
+        /// 시리얼 포트 연결/해제 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialConnect_Click(object sender, EventArgs e)
+        {
+            Button b = sender as Button;
+            if (Serial.IsOpen == false)
+            {
+                Serial.Open();
+                if (Serial.IsOpen)
+                {
+                    b.Text = "Disconn";
+                    Parent.ChipCtrlTextboxes[0].Text = Serial.Config.PortName + "-" + Serial.Config.BaudRate.ToString();
+                }
+            }
+            else
+            {
+                Serial.Close();
+                if (!Serial.IsOpen)
+                    b.Text = "Connect";
+            }
+        }
+
+        /// <summary>
+        /// 시리얼 포트 설정 창을 여는 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialSetting_Click(object sender, EventArgs e)
+        {
+            JLcLib.Comn.WireComnForm.Show(Serial);
+            Serial.WriteSettingFile(Parent.IniFile, "Lyon");
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '수동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Manual_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '자동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Auto_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.AUTO;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_AUTO.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_AUTO)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 메인 폼의 'Run Log' 버튼 활성화 여부를 결정하기 위해 호출됩니다.
+        /// </summary>
+        /// <returns>시리얼 포트가 열려 있으면 true를 반환합니다.</returns>
+        public override bool CheckConnectionForLog()
+        {
+            return ((Serial != null) && Serial.IsOpen);
+        }
+
+        /// <summary>
+        /// 'Run Log' 기능이 활성화되었을 때 주기적으로 호출되어 시리얼 데이터를 처리합니다.
+        /// </summary>
+        public override void RunLog()
+        {
+            if (Serial.IsOpen && (Serial.RcvQueue.Count != 0))
+            {
+                // 수신 큐에 있는 모든 데이터를 읽어와 로그 창에 표시합니다.
+                for (int i = 0; i < Serial.RcvQueue.Count; i++)
+                {
+                    byte b = Serial.RcvQueue.Get();
+                    if ((b > 0x00 && b < 0x80) && b != '\0')
+                    {
+                        LogMessage += (char)b;
+                        if (b == '\n') // 개행 문자를 만나면 한 줄로 처리하여 출력
+                        {
+                            Log.WriteWithElapsedTime(LogMessage);
+                            Log.WriteLine("\n");
+                            LogMessage = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 메인 폼의 커맨드 입력창에서 받은 문자열을 시리얼 포트로 전송합니다.
+        /// </summary>
+        /// <param name="Command">전송할 명령어 문자열</param>
+        public override void SendCommand(string Command)
+        {
+            Command += "\r\n"; // 명령어 끝에 CR+LF 추가
+            byte[] Var = Encoding.ASCII.GetBytes(Command);
+            Serial.WriteBytes(Var, Var.Length, true);
+        }
+
+        /// <summary>
+        /// 메인 폼의 'Run Test' 버튼을 눌렀을 때 호출되는 메인 테스트 실행 함수입니다.
+        /// </summary>
+        /// <param name="TestItemIndex">콤보박스에서 선택된 테스트 항목의 인덱스</param>
+        /// <param name="Arg">테스트에 필요한 인자값 문자열</param>
+        public override void RunTest(int TestItemIndex, string Arg)
+        {
+            int iVal;
+            try { iVal = int.Parse(Arg, System.Globalization.NumberStyles.Number); }
+            catch { iVal = 0; }
+
+            // 현재 선택된 모드(MANUAL/AUTO)에 따라 분기합니다.
+            switch (CombBox_Item)
+            {
+                case COMBOBOX_ITEMS.MANUAL:
+                    // 선택된 수동 테스트 항목에 따라 해당 테스트 함수를 호출합니다.
+                    switch ((TEST_ITEMS_MANUAL)TestItemIndex)
+                    {
+                        case TEST_ITEMS_MANUAL.JUWON:
+                            if (Arg == "")
+                            {
+                                Log.WriteLine("시작할 값을 텍스트상자에 10진수로 적어주세요. (0~511)");
+                            }
+                            else
+                            {
+                                Log.WriteLine("Start : " + Arg);
+                                Write_Register_for_juwon(iVal);
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                case COMBOBOX_ITEMS.AUTO:
+                    // 자동 테스트 로직 구현
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        #region Function for Chip Test
+        /// <summary>
+        /// 'JUWON' 테스트 항목에 대한 실제 동작을 정의하는 함수입니다.
+        /// </summary>
+        /// <param name="iVal">테스트 시작 값</param>
+        private void Write_Register_for_juwon(int iVal)
+        {
+            // 레지스터 맵에서 "ZCD_DELAY_TRIM_SEL<8:0>" 이름의 비트 필드를 가져옵니다.
+            RegisterItem ZCD_DELAY_TRIM_SEL = Parent.RegMgr.GetRegisterItem("ZCD_DELAY_TRIM_SEL<8:0>");
+
+            // 입력받은 값(iVal)부터 0까지 1씩 감소시키면서 해당 레지스터에 값을 씁니다.
+            for (int i = iVal; i >= 0; i--)
+            {
+                ZCD_DELAY_TRIM_SEL.Value = (uint)i;
+                ZCD_DELAY_TRIM_SEL.Write(); // 설정된 값을 칩에 실제로 씀
+            }
+        }
+        #endregion
+    }
+
+    public class Salus8 : ChipControl
+    {
+        #region Variable and declaration
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 수동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_MANUAL
+        {
+            TEST,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 자동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_AUTO
+        {
+            TEST,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// 현재 선택된 테스트 모드(수동/자동)를 관리하기 위한 열거형입니다.
+        /// </summary>
+        public enum COMBOBOX_ITEMS
+        {
+            MANUAL,
+            AUTO,
+        }
+
+        // SPI 통신을 위한 인터페이스 객체. 부모 폼(RegContForm)으로부터 전달받습니다.
+        private JLcLib.Custom.SPI SPI = null;
+
+        // UART 통신을 위한 시리얼 포트 객체.
+        private JLcLib.Comn.Serial Serial { get; set; } = new JLcLib.Comn.Serial();
+
+        // 시리얼 데이터 수신 여부를 나타내는 플래그.
+        private bool IsSerialReceivedData = false;
+        private bool IsRunCal = false;
+
+        /* * 외부 계측 장비 제어를 위한 SCPI 객체들입니다. */
+        JLcLib.Instrument.SCPI PowerSupply0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter1 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter2 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter3 = null;
+        JLcLib.Instrument.SCPI OscilloScope0 = null;
+        JLcLib.Instrument.SCPI SpectrumAnalyzer = null;
+        JLcLib.Instrument.SCPI TempChamber = null;
+
+        // 현재 UI에 선택된 테스트 모드를 저장하는 변수입니다.
+        private COMBOBOX_ITEMS CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+
+        #endregion Variable and declaration
+
+        /// <summary>
+        /// Salus8 클래스의 생성자입니다.
+        /// </summary>
+        /// <param name="form">메인 UI 폼 객체</param>
+        public Salus8(RegContForm form) : base(form)
+        {
+            // 부모 폼의 SPI 객체를 할당합니다.
+            SPI = Parent.SPI;
+
+            // 설정 파일(.ini)에서 "Salus8" 섹션의 시리얼 포트 설정을 읽어옵니다.
+            Serial.ReadSettingFile(form.IniFile, "Salus8");
+
+            // 시리얼 데이터 수신 이벤트 핸들러를 등록합니다.
+            Serial.DataReceived += Serial_DataReceived;
+
+            // 캘리브레이션 데이터 배열을 초기화합니다.
+            CalibrationData = new byte[256];
+
+            /* UI의 테스트 항목 콤보박스를 초기화합니다. */
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 시리얼 포트로부터 데이터가 수신될 때 호출되는 이벤트 핸들러입니다.
+        /// </summary>
+        private void Serial_DataReceived(object sender, JLcLib.Comn.RcvEventArgs e)
+        {
+            IsSerialReceivedData = true;
+        }
+
+        /// <summary>
+        /// Salus8 칩의 특정 주소에 16비트 데이터를 쓰는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">쓰기를 수행할 7비트 레지스터 주소</param>
+        /// <param name="Data">쓸 16비트 데이터</param>
+        private void WriteRegister(uint Address, uint Data)
+        {
+            byte[] Bytes = new byte[3];
+            byte rwFlag = 1; // 쓰기 플래그
+
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+            Bytes[1] = (byte)((Data >> 8) & 0xff);
+            Bytes[2] = (byte)((Data >> 0) & 0xff);
+
+            SPI.WriteBytes(Bytes, 3, true);
+        }
+
+        /// <summary>
+        /// Salus8 칩의 특정 주소에서 16비트 데이터를 읽어오는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">읽기를 수행할 7비트 레지스터 주소</param>
+        /// <returns>읽어온 16비트 데이터</returns>
+        private uint ReadRegister(uint Address)
+        {
+            byte rwFlag = 0; // 읽기 플래그
+            uint Data = 0xFFFF;
+            byte[] Bytes = new byte[1];
+            byte[] Buff = new byte[2];
+
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+
+            Buff = SPI.WriteAndReadBytes(Bytes, 1, 2);
+
+            Data = (uint)((Buff[0] << 8) | (Buff[1] << 0));
+
+            return Data;
+        }
+
+        /// <summary>
+        /// Excel 데이터를 파싱하여 RegisterGroup 객체로 변환합니다.
+        /// </summary>
+        /// <param name="GroupName">레지스터 그룹 이름</param>
+        /// <param name="RegData">Excel 원본 데이터</param>
+        /// <returns>파싱된 RegisterGroup 객체</returns>
+        public override JLcLib.Chip.RegisterGroup MakeRegisterGroup(string GroupName, string[,] RegData)
+        {
+            JLcLib.Chip.RegisterGroup rg = new JLcLib.Chip.RegisterGroup(GroupName, WriteRegister, ReadRegister);
+
+            for (int xStart = 0; xStart < 3; xStart++)
+            {
+                for (int Row = 0; Row < RegData.GetLength(0); Row++)
+                {
+                    if ((RegData[Row, xStart] == "Bit") && (RegData[Row + 1, xStart] == "Name") && (RegData[Row + 2, xStart] == "Default"))
+                    {
+                        string RegName = null;
+                        uint Address = 0;
+
+                        string StrAddr = RegData[Row - 1, xStart + 1];
+                        if (StrAddr.StartsWith("0x"))
+                            StrAddr = StrAddr.Substring(2);
+                        Address = uint.Parse(StrAddr, System.Globalization.NumberStyles.HexNumber);
+                        RegName = RegData[Row - 1, xStart + 2];
+
+                        JLcLib.Chip.Register reg = rg.Registers.Add(RegName, Address);
+
+                        for (int Column = xStart + 1; Column < RegData.GetLength(1); Column++)
+                        {
+                            if (!((RegData[Row + 2, Column] == "X") || (RegData[Row + 2, Column] == "-") || (RegData[Row + 2, Column] == null) || (RegData[Row + 1, Column] == null)))
+                            {
+                                string ItemName = null, ItemDesc = null;
+                                int UpperBit = 0, LowerBit = 0;
+                                uint ItemValue = 0;
+
+                                ItemName = RegData[Row + 1, Column];
+                                UpperBit = int.Parse(RegData[Row, Column]);
+                                LowerBit = int.Parse(RegData[Row, Column]);
+                                ItemValue = (uint)((RegData[Row + 2, Column] == "0") ? 0 : 1);
+
+                                for (int x = Column + 1; x < RegData.GetLength(1); x++)
+                                {
+                                    if (RegData[Row + 1, x] == null)
+                                    {
+                                        if (RegData[Row, x] != null)
+                                        {
+                                            LowerBit = int.Parse(RegData[Row, x]);
+                                            ItemValue = (ItemValue << 1) | (uint)((RegData[Row + 2, x] == "0") ? 0 : 1);
+                                        }
+                                    }
+                                    else break;
+                                }
+
+                                for (int y = Row; y < RegData.GetLength(0); y++)
+                                {
+                                    if (RegData[y, xStart] == ItemName)
+                                    {
+                                        ItemDesc = RegData[y, xStart + 1];
+                                        // ... (상세 설명 파싱 로직)
+                                    }
+                                }
+                                reg.Items.Add(ItemName, UpperBit, LowerBit, ItemValue, ItemDesc);
+                            }
+                        }
+                    }
+                }
+            }
+            return rg;
+        }
+
+        /// <summary>
+        /// Salus8 칩에 특화된 UI를 설정합니다. 현재는 비어 있습니다.
+        /// </summary>
+        public override void SetChipSpecificUI()
+        {
+            /*
+             * 이 공간에 Salus8 칩에만 필요한 버튼이나 텍스트 박스 등의 UI 컨트롤을
+             * 활성화하고 이벤트 핸들러를 할당하는 코드를 작성합니다.
+             */
+        }
+
+        /// <summary>
+        /// 시리얼 포트 연결/해제 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialConnect_Click(object sender, EventArgs e)
+        {
+            Button b = sender as Button;
+            if (Serial.IsOpen == false)
+            {
+                Serial.Open();
+                if (Serial.IsOpen)
+                {
+                    b.Text = "Disconn";
+                    Parent.ChipCtrlTextboxes[0].Text = Serial.Config.PortName + "-" + Serial.Config.BaudRate.ToString();
+                }
+            }
+            else
+            {
+                Serial.Close();
+                if (!Serial.IsOpen)
+                    b.Text = "Connect";
+            }
+        }
+
+        /// <summary>
+        /// 시리얼 포트 설정 창을 여는 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialSetting_Click(object sender, EventArgs e)
+        {
+            JLcLib.Comn.WireComnForm.Show(Serial);
+            Serial.WriteSettingFile(Parent.IniFile, "Salus8");
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '수동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Manual_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '자동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Auto_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.AUTO;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_AUTO.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_AUTO)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 'Run Log' 버튼 활성화 여부를 결정합니다.
+        /// </summary>
+        public override bool CheckConnectionForLog()
+        {
+            return ((Serial != null) && Serial.IsOpen);
+        }
+
+        /// <summary>
+        /// 시리얼 데이터를 처리하여 로그 창에 표시합니다.
+        /// </summary>
+        public override void RunLog()
+        {
+            if (Serial.IsOpen && (Serial.RcvQueue.Count != 0))
+            {
+                for (int i = 0; i < Serial.RcvQueue.Count; i++)
+                {
+                    byte b = Serial.RcvQueue.Get();
+                    if ((b > 0x00 && b < 0x80) && b != '\0')
+                    {
+                        LogMessage += (char)b;
+                        if (b == '\n')
+                        {
+                            Log.WriteWithElapsedTime(LogMessage);
+                            Log.WriteLine("\n");
+                            LogMessage = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 커맨드 입력창의 문자열을 시리얼 포트로 전송합니다.
+        /// </summary>
+        public override void SendCommand(string Command)
+        {
+            Command += "\r\n";
+            byte[] Var = Encoding.ASCII.GetBytes(Command);
+            Serial.WriteBytes(Var, Var.Length, true);
+        }
+
+        /// <summary>
+        /// 'Run Test' 버튼 클릭 시 호출되는 메인 테스트 함수입니다.
+        /// </summary>
+        public override void RunTest(int TestItemIndex, string Arg)
+        {
+            int iVal;
+            try { iVal = int.Parse(Arg, System.Globalization.NumberStyles.Number); }
+            catch { iVal = 0; }
+
+            switch (CombBox_Item)
+            {
+                case COMBOBOX_ITEMS.MANUAL:
+                    switch ((TEST_ITEMS_MANUAL)TestItemIndex)
+                    {
+                        // 여기에 수동 테스트 항목에 대한 case를 추가합니다.
+                        default:
+                            break;
+                    }
+                    break;
+                case COMBOBOX_ITEMS.AUTO:
+                    switch ((TEST_ITEMS_AUTO)TestItemIndex)
+                    {
+                        // 여기에 자동 테스트 항목에 대한 case를 추가합니다.
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        #region Function for Chip Test
+        // 이 영역에 Salus8 칩을 위한 테스트 함수들을 구현합니다.
+        #endregion
+    }
+
+    public class IRIS2 : ChipControl
+    {
+        #region Variable and declaration
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 수동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_MANUAL
+        {
+            TEST,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 자동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_AUTO
+        {
+            TEST,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// 현재 선택된 테스트 모드(수동/자동)를 관리하기 위한 열거형입니다.
+        /// </summary>
+        public enum COMBOBOX_ITEMS
+        {
+            MANUAL,
+            AUTO,
+        }
+
+        // SPI 통신을 위한 인터페이스 객체.
+        private JLcLib.Custom.SPI SPI = null;
+
+        // UART 통신을 위한 시리얼 포트 객체.
+        private JLcLib.Comn.Serial Serial { get; set; } = new JLcLib.Comn.Serial();
+
+        // 시리얼 데이터 수신 여부를 나타내는 플래그.
+        private bool IsSerialReceivedData = false;
+        private bool IsRunCal = false;
+
+        /* * 외부 계측 장비 제어를 위한 SCPI 객체들입니다. */
+        JLcLib.Instrument.SCPI PowerSupply0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter1 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter2 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter3 = null;
+        JLcLib.Instrument.SCPI OscilloScope0 = null;
+        JLcLib.Instrument.SCPI SpectrumAnalyzer = null;
+        JLcLib.Instrument.SCPI TempChamber = null;
+
+        // 현재 UI에 선택된 테스트 모드를 저장하는 변수입니다.
+        private COMBOBOX_ITEMS CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+
+        #endregion Variable and declaration
+
+        /// <summary>
+        /// IRIS2 클래스의 생성자입니다.
+        /// </summary>
+        /// <param name="form">메인 UI 폼 객체</param>
+        public IRIS2(RegContForm form) : base(form)
+        {
+            // 부모 폼의 SPI 객체를 할당합니다.
+            SPI = Parent.SPI;
+
+            // 설정 파일(.ini)에서 "IRIS2" 섹션의 시리얼 포트 설정을 읽어옵니다.
+            Serial.ReadSettingFile(form.IniFile, "IRIS2");
+
+            // 시리얼 데이터 수신 이벤트 핸들러를 등록합니다.
+            Serial.DataReceived += Serial_DataReceived;
+
+            // 캘리브레이션 데이터 배열을 초기화합니다.
+            CalibrationData = new byte[256];
+
+            /* UI의 테스트 항목 콤보박스를 초기화합니다. */
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 시리얼 포트로부터 데이터가 수신될 때 호출되는 이벤트 핸들러입니다.
+        /// </summary>
+        private void Serial_DataReceived(object sender, JLcLib.Comn.RcvEventArgs e)
+        {
+            IsSerialReceivedData = true;
+        }
+
+        /// <summary>
+        /// IRIS2 칩의 특정 주소에 16비트 데이터를 쓰는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">쓰기를 수행할 7비트 레지스터 주소</param>
+        /// <param name="Data">쓸 16비트 데이터</param>
+        private void WriteRegister(uint Address, uint Data)
+        {
+            byte[] Bytes = new byte[3];
+            byte rwFlag = 1; // 쓰기 플래그
+
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+            Bytes[1] = (byte)((Data >> 8) & 0xff);
+            Bytes[2] = (byte)((Data >> 0) & 0xff);
+
+            SPI.WriteBytes(Bytes, 3, true);
+        }
+
+        /// <summary>
+        /// IRIS2 칩의 특정 주소에서 16비트 데이터를 읽어오는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">읽기를 수행할 7비트 레지스터 주소</param>
+        /// <returns>읽어온 16비트 데이터</returns>
+        private uint ReadRegister(uint Address)
+        {
+            byte rwFlag = 0; // 읽기 플래그
+            uint Data = 0xFFFF;
+            byte[] Bytes = new byte[1];
+            byte[] Buff = new byte[2];
+
+            Bytes[0] = (byte)((rwFlag << 7) | (Address & 0x7F));
+
+            Buff = SPI.WriteAndReadBytes(Bytes, 1, 2);
+
+            Data = (uint)((Buff[0] << 8) | (Buff[1] << 0));
+
+            return Data;
+        }
+
+        /// <summary>
+        /// Excel 데이터를 파싱하여 RegisterGroup 객체로 변환합니다.
+        /// </summary>
+        /// <param name="GroupName">레지스터 그룹 이름</param>
+        /// <param name="RegData">Excel 원본 데이터</param>
+        /// <returns>파싱된 RegisterGroup 객체</returns>
+        public override JLcLib.Chip.RegisterGroup MakeRegisterGroup(string GroupName, string[,] RegData)
+        {
+            JLcLib.Chip.RegisterGroup rg = new JLcLib.Chip.RegisterGroup(GroupName, WriteRegister, ReadRegister);
+
+            for (int xStart = 0; xStart < 3; xStart++)
+            {
+                for (int Row = 0; Row < RegData.GetLength(0); Row++)
+                {
+                    if ((RegData[Row, xStart] == "Bit") && (RegData[Row + 1, xStart] == "Name") && (RegData[Row + 2, xStart] == "Default"))
+                    {
+                        string RegName = null;
+                        uint Address = 0;
+
+                        string StrAddr = RegData[Row - 1, xStart + 1];
+                        if (StrAddr.StartsWith("0x"))
+                            StrAddr = StrAddr.Substring(2);
+                        Address = uint.Parse(StrAddr, System.Globalization.NumberStyles.HexNumber);
+                        RegName = RegData[Row - 1, xStart + 2];
+
+                        JLcLib.Chip.Register reg = rg.Registers.Add(RegName, Address);
+
+                        for (int Column = xStart + 1; Column < RegData.GetLength(1); Column++)
+                        {
+                            if (!((RegData[Row + 2, Column] == "X") || (RegData[Row + 2, Column] == "-") || (RegData[Row + 2, Column] == null) || (RegData[Row + 1, Column] == null)))
+                            {
+                                string ItemName = null, ItemDesc = null;
+                                int UpperBit = 0, LowerBit = 0;
+                                uint ItemValue = 0;
+
+                                ItemName = RegData[Row + 1, Column];
+                                UpperBit = int.Parse(RegData[Row, Column]);
+                                LowerBit = int.Parse(RegData[Row, Column]);
+                                ItemValue = (uint)((RegData[Row + 2, Column] == "0") ? 0 : 1);
+
+                                for (int x = Column + 1; x < RegData.GetLength(1); x++)
+                                {
+                                    if (RegData[Row + 1, x] == null)
+                                    {
+                                        if (RegData[Row, x] != null)
+                                        {
+                                            LowerBit = int.Parse(RegData[Row, x]);
+                                            ItemValue = (ItemValue << 1) | (uint)((RegData[Row + 2, x] == "0") ? 0 : 1);
+                                        }
+                                    }
+                                    else break;
+                                }
+
+                                for (int y = Row; y < RegData.GetLength(0); y++)
+                                {
+                                    if (RegData[y, xStart] == ItemName)
+                                    {
+                                        ItemDesc = RegData[y, xStart + 1];
+                                        // ... (상세 설명 파싱 로직)
+                                    }
+                                }
+                                reg.Items.Add(ItemName, UpperBit, LowerBit, ItemValue, ItemDesc);
+                            }
+                        }
+                    }
+                }
+            }
+            return rg;
+        }
+
+        /// <summary>
+        /// IRIS2 칩에 특화된 UI를 설정합니다. 현재는 비어 있습니다.
+        /// </summary>
+        public override void SetChipSpecificUI()
+        {
+            /*
+             * 이 공간에 IRIS2 칩에만 필요한 버튼이나 텍스트 박스 등의 UI 컨트롤을
+             * 활성화하고 이벤트 핸들러를 할당하는 코드를 작성합니다.
+             */
+        }
+
+        /// <summary>
+        /// 시리얼 포트 연결/해제 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialConnect_Click(object sender, EventArgs e)
+        {
+            Button b = sender as Button;
+            if (Serial.IsOpen == false)
+            {
+                Serial.Open();
+                if (Serial.IsOpen)
+                {
+                    b.Text = "Disconn";
+                    Parent.ChipCtrlTextboxes[0].Text = Serial.Config.PortName + "-" + Serial.Config.BaudRate.ToString();
+                }
+            }
+            else
+            {
+                Serial.Close();
+                if (!Serial.IsOpen)
+                    b.Text = "Connect";
+            }
+        }
+
+        /// <summary>
+        /// 시리얼 포트 설정 창을 여는 버튼 클릭 이벤트 핸들러입니다.
+        /// </summary>
+        private void SerialSetting_Click(object sender, EventArgs e)
+        {
+            JLcLib.Comn.WireComnForm.Show(Serial);
+            Serial.WriteSettingFile(Parent.IniFile, "IRIS2");
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '수동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Manual_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 테스트 콤보박스를 '자동' 모드 항목으로 변경합니다.
+        /// </summary>
+        private void Change_To_Auto_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.AUTO;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_AUTO.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_AUTO)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 'Run Log' 버튼 활성화 여부를 결정합니다.
+        /// </summary>
+        public override bool CheckConnectionForLog()
+        {
+            return ((Serial != null) && Serial.IsOpen);
+        }
+
+        /// <summary>
+        /// 시리얼 데이터를 처리하여 로그 창에 표시합니다.
+        /// </summary>
+        public override void RunLog()
+        {
+            if (Serial.IsOpen && (Serial.RcvQueue.Count != 0))
+            {
+                for (int i = 0; i < Serial.RcvQueue.Count; i++)
+                {
+                    byte b = Serial.RcvQueue.Get();
+                    if ((b > 0x00 && b < 0x80) && b != '\0')
+                    {
+                        LogMessage += (char)b;
+                        if (b == '\n')
+                        {
+                            Log.WriteWithElapsedTime(LogMessage);
+                            Log.WriteLine("\n");
+                            LogMessage = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 커맨드 입력창의 문자열을 시리얼 포트로 전송합니다.
+        /// </summary>
+        public override void SendCommand(string Command)
+        {
+            Command += "\r\n";
+            byte[] Var = Encoding.ASCII.GetBytes(Command);
+            Serial.WriteBytes(Var, Var.Length, true);
+        }
+
+        /// <summary>
+        /// 'Run Test' 버튼 클릭 시 호출되는 메인 테스트 함수입니다.
+        /// </summary>
+        public override void RunTest(int TestItemIndex, string Arg)
+        {
+            int iVal;
+            try { iVal = int.Parse(Arg, System.Globalization.NumberStyles.Number); }
+            catch { iVal = 0; }
+
+            switch (CombBox_Item)
+            {
+                case COMBOBOX_ITEMS.MANUAL:
+                    switch ((TEST_ITEMS_MANUAL)TestItemIndex)
+                    {
+                        // 여기에 수동 테스트 항목에 대한 case를 추가합니다.
+                        default:
+                            break;
+                    }
+                    break;
+                case COMBOBOX_ITEMS.AUTO:
+                    switch ((TEST_ITEMS_AUTO)TestItemIndex)
+                    {
+                        // 여기에 자동 테스트 항목에 대한 case를 추가합니다.
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        #region Function for Chip Test
+        // 이 영역에 IRIS2 칩을 위한 테스트 함수들을 구현합니다.
+        #endregion
+    }
+
+    public class Chicago : ChipControl
+    {
+        #region Variable and declaration
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 수동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_MANUAL
+        {
+            Write_SRAM,     // SRAM에 데이터 쓰기
+            Read_SRAM,      // SRAM에서 데이터 읽기
+            WaveEffect_Start,
+            ScrollText_Start,
+            BreathingEffect_Start,
+            ClockEffect_Start,
+            LED_Effect_Stop,  
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 자동 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_AUTO
+        {
+            TEST,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// UI의 테스트 콤보박스에 표시될 명령어(CMD) 테스트 항목을 정의합니다.
+        /// </summary>
+        public enum TEST_ITEMS_CMD
+        {
+            UpdateDisplay,
+            WriteDisplay,
+            TurnOffDisplay,
+            WakeUp,
+            Sleep,
+            Reset,
+            NUM_TEST_ITEMS,
+        }
+
+        /// <summary>
+        /// 현재 선택된 테스트 모드(수동/자동/명령어)를 관리하기 위한 열거형입니다.
+        /// </summary>
+        public enum COMBOBOX_ITEMS
+        {
+            MANUAL,
+            AUTO,
+            CMD,
+        }
+
+        // 8x5 크기의 비트맵 폰트 데이터 (알파벳 대문자 및 숫자)
+        private readonly Dictionary<char, byte[]> Font = new Dictionary<char, byte[]>()
+        {
+            {'A', new byte[]{0x7E, 0x11, 0x11, 0x11, 0x7E}},
+            {'B', new byte[]{0x7F, 0x49, 0x49, 0x49, 0x36}},
+            {'C', new byte[]{0x3E, 0x41, 0x41, 0x41, 0x22}},
+            {'D', new byte[]{0x7F, 0x41, 0x41, 0x22, 0x1C}},
+            {'E', new byte[]{0x7F, 0x49, 0x49, 0x49, 0x41}},
+            {'F', new byte[]{0x7F, 0x09, 0x09, 0x09, 0x01}},
+            {'G', new byte[]{0x3E, 0x41, 0x49, 0x49, 0x7A}},
+            {'H', new byte[]{0x7F, 0x08, 0x08, 0x08, 0x7F}},
+            {'I', new byte[]{0x00, 0x41, 0x7F, 0x41, 0x00}},
+            {'J', new byte[]{0x20, 0x40, 0x41, 0x3F, 0x01}},
+            {'K', new byte[]{0x7F, 0x08, 0x14, 0x22, 0x41}},
+            {'L', new byte[]{0x7F, 0x40, 0x40, 0x40, 0x40}},
+            {'M', new byte[]{0x7F, 0x02, 0x04, 0x02, 0x7F}},
+            {'N', new byte[]{0x7F, 0x04, 0x08, 0x10, 0x7F}},
+            {'O', new byte[]{0x3E, 0x41, 0x41, 0x41, 0x3E}},
+            {'P', new byte[]{0x7F, 0x09, 0x09, 0x09, 0x06}},
+            {'Q', new byte[]{0x3E, 0x41, 0x51, 0x21, 0x5E}},
+            {'R', new byte[]{0x7F, 0x09, 0x19, 0x29, 0x46}},
+            {'S', new byte[]{0x46, 0x49, 0x49, 0x49, 0x31}},
+            {'T', new byte[]{0x01, 0x01, 0x7F, 0x01, 0x01}},
+            {'U', new byte[]{0x3F, 0x40, 0x40, 0x40, 0x3F}},
+            {'V', new byte[]{0x1F, 0x20, 0x40, 0x20, 0x1F}},
+            {'W', new byte[]{0x3F, 0x40, 0x38, 0x40, 0x3F}},
+            {'X', new byte[]{0x63, 0x14, 0x08, 0x14, 0x63}},
+            {'Y', new byte[]{0x07, 0x08, 0x70, 0x08, 0x07}},
+            {'Z', new byte[]{0x61, 0x51, 0x49, 0x45, 0x43}},
+            {'0', new byte[]{0x3E, 0x51, 0x49, 0x45, 0x3E}},
+            {'1', new byte[]{0x00, 0x42, 0x7F, 0x40, 0x00}},
+            {'2', new byte[]{0x42, 0x61, 0x51, 0x49, 0x46}},
+            {'3', new byte[]{0x21, 0x41, 0x45, 0x4B, 0x31}},
+            {'4', new byte[]{0x18, 0x14, 0x12, 0x7F, 0x10}},
+            {'5', new byte[]{0x27, 0x45, 0x45, 0x45, 0x39}},
+            {'6', new byte[]{0x3C, 0x4A, 0x49, 0x49, 0x30}},
+            {'7', new byte[]{0x01, 0x71, 0x09, 0x05, 0x03}},
+            {'8', new byte[]{0x36, 0x49, 0x49, 0x49, 0x36}},
+            {'9', new byte[]{0x06, 0x49, 0x49, 0x29, 0x1E}},
+            {':', new byte[]{0x00, 0x24, 0x24, 0x00, 0x00}},
+            {' ', new byte[]{0x00, 0x00, 0x00, 0x00, 0x00}},
+        };
+
+        // SPI 통신을 위한 인터페이스 객체.
+        private JLcLib.Custom.SPI SPI = null;
+
+        // UART 통신을 위한 시리얼 포트 객체.
+        private JLcLib.Comn.Serial Serial { get; set; } = new JLcLib.Comn.Serial();
+
+        // 시리얼 데이터 수신 여부를 나타내는 플래그.
+        private bool IsSerialReceivedData = false;
+
+        private BackgroundWorker animationWorker = null;
+
+        /* * 외부 계측 장비 제어를 위한 SCPI 객체들입니다. */
+        JLcLib.Instrument.SCPI PowerSupply0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter0 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter1 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter2 = null;
+        JLcLib.Instrument.SCPI DigitalMultimeter3 = null;
+        JLcLib.Instrument.SCPI OscilloScope0 = null;
+        JLcLib.Instrument.SCPI SpectrumAnalyzer = null;
+        JLcLib.Instrument.SCPI TempChamber = null;
+
+        // 현재 UI에 선택된 테스트 모드를 저장하는 변수입니다.
+        private COMBOBOX_ITEMS CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+
+        #endregion Variable and declaration
+
+        /// <summary>
+        /// Chicago 클래스의 생성자입니다.
+        /// </summary>
+        /// <param name="form">메인 UI 폼 객체</param>
+        public Chicago(RegContForm form) : base(form)
+        {
+            SPI = Parent.SPI;
+            Serial.ReadSettingFile(form.IniFile, "Chicago");
+            Serial.DataReceived += Serial_DataReceived;
+            CalibrationData = new byte[256];
+
+            // UI의 테스트 콤보박스를 기본 모드인 'MANUAL'로 초기화합니다.
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        /// <summary>
+        /// 시리얼 포트로부터 데이터가 수신될 때 호출되는 이벤트 핸들러입니다.
+        /// </summary>
+        private void Serial_DataReceived(object sender, JLcLib.Comn.RcvEventArgs e)
+        {
+            IsSerialReceivedData = true;
+        }
+
+        /// <summary>
+        /// Chicago 칩의 특정 주소에 8비트 데이터를 쓰는 SPI 프로토콜을 구현합니다.
+        /// 3단계의 SPI 패킷 전송을 통해 하나의 레지스터 쓰기 동작이 완료됩니다.
+        /// </summary>
+        /// <param name="Address">쓰기를 수행할 16비트 레지스터 주소</param>
+        /// <param name="Data">쓸 8비트 데이터</param>
+        public void WriteRegister(uint Address, uint Data)
+        {
+            byte[] bytes;
+
+            // 1. 주소 설정 (CMD: 0xC0)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC0;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF); // 체크섬
+            bytes[4] = (byte)((Address >> 8) & 0xFF); // 주소 상위 바이트
+            bytes[5] = (byte)((Address >> 0) & 0xFF); // 주소 하위 바이트
+            bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF); // 체크섬
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 2. 데이터 길이 설정 (CMD: 0xC1, 길이는 1로 고정)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC1;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            bytes[4] = 0x00;
+            bytes[5] = 0x01; // 길이 = 1
+            bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF);
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 3. 실제 데이터 쓰기 (CMD: 0xC2)
+            bytes = new byte[6];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC2;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            bytes[4] = (byte)(Data & 0xff); // 실제 데이터
+            bytes[5] = bytes[4]; // 체크섬
+            SPI.WriteBytesForChicago(bytes, 6, true);
+        }
+
+        /// <summary>
+        /// Chicago 칩의 특정 주소에서 8비트 데이터를 읽어오는 SPI 프로토콜을 구현합니다.
+        /// </summary>
+        /// <param name="Address">읽기를 수행할 16비트 레지스터 주소</param>
+        /// <returns>읽어온 8비트 데이터</returns>
+        public uint ReadRegister(uint Address)
+        {
+            uint Data = 0xFF;
+            byte[] bytes;
+            byte[] rx;
+
+            switch (Address)
+            {
+                // 특정 주소(0x4FE, 0x4FF)는 다른 명령어로 읽어야 하는 예외 케이스입니다.
+                case 0x4FE:
+                case 0x4FF:
+                    bytes = new byte[4];
+                    bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0x07; // 다른 읽기 명령어
+                    bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+                    rx = SPI.WriteAndReadBytesForChicago(bytes, 4, 2);
+
+                    if (Address == 0x4FE)
+                    {
+                        Data = (uint)(rx[0] & 0xff);
+                    }
+                    else if (Address == 0x4FF)
+                    {
+                        Data = (uint)(rx[1] & 0xff);
+                    }
+                    break;
+                // 일반적인 레지스터 읽기
+                default:
+                    // 1. 읽을 주소 설정 (CMD: 0xC0)
+                    bytes = new byte[7];
+                    bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC0;
+                    bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+                    bytes[4] = (byte)((Address >> 8) & 0xFF);
+                    bytes[5] = (byte)((Address >> 0) & 0xFF);
+                    bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF);
+                    SPI.WriteBytes(bytes, 7, true);
+
+                    // 2. 읽을 데이터 길이 설정 (CMD: 0xC1, 길이는 1로 고정)
+                    bytes = new byte[7];
+                    bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC1;
+                    bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+                    bytes[4] = 0x00;
+                    bytes[5] = 0x01;
+                    bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF);
+                    SPI.WriteBytes(bytes, 7, true);
+
+                    // 3. 데이터 읽기 요청 (CMD: 0xC3)
+                    bytes = new byte[4];
+                    bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC3;
+                    bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+                    rx = SPI.WriteAndReadBytesForChicago(bytes, 4, 2);
+
+                    Data = (uint)(rx[0] & 0xff);
+                    break;
+            }
+
+            return Data;
+        }
+
+        /// <summary>
+        /// Chicago 칩의 레지스터 값에 따라 LED 매트릭스 그리드의 총 바이트 수를 계산합니다.
+        /// </summary>
+        /// <returns>필요한 총 바이트 수</returns>
+        public int CalculateChicagoGridSizeBytes()
+        {
+            uint reg408_val = ReadRegister(0x408);
+            uint reg401_val = ReadRegister(0x401);
+
+            bool is9GridMode = ((reg408_val >> 2) & 0x01) == 1;
+            uint g_n = (reg401_val >> 2) & 0x0F;
+
+            int numGrids = 0;
+            if (is9GridMode)
+            {
+                if (g_n <= 7) numGrids = (int)g_n + 1;
+                else numGrids = 9;
+            }
+            else
+            {
+                if (g_n <= 8) numGrids = (int)g_n + 1;
+                else numGrids = 10;
+            }
+            return numGrids * 32;
+        }
+
+        /// <summary>
+        /// 'WriteDisplay' 테스트를 실행합니다. HexWriteForm을 띄워 사용자 입력을 받고, 칩에 전송합니다.
+        /// </summary>
+        public void RunWriteLEDData()
+        {
+            int totalBytes = CalculateChicagoGridSizeBytes();
+            if (totalBytes == 0)
+            {
+                MessageBox.Show("계산된 LED 개수가 0입니다. 칩 설정을 확인하세요.", "알림", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using (var hexForm = new HexWriteForm(totalBytes))
+            {
+                if (hexForm.ShowDialog(Parent) == DialogResult.OK)
+                {
+                    WriteLEDDataWithHexForm((uint)totalBytes, hexForm.ResultData);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 'Write_SRAM' 테스트를 실행합니다. 사용자로부터 주소를 입력받고 HexWriteForm을 띄웁니다.
+        /// </summary>
+        public void RunSRAMWrite(uint startAddress, int length = 320)
+        {
+            using (var hexForm = new HexWriteForm(length))
+            {
+                hexForm.Text = $"SRAM Write (Addr: 0x{startAddress:X4}, Len: {length})";
+
+                if (hexForm.ShowDialog(Parent) == DialogResult.OK)
+                {
+                    WriteSRAMWithHexForm(startAddress, hexForm.ResultData);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 'Read_SRAM' 테스트를 실행합니다. 사용자로부터 주소를 입력받고 데이터를 읽어와 HexWriteForm으로 보여줍니다.
+        /// </summary>
+        public void RunSRAMRead(uint startAddress, uint length = 320)
+        {
+            byte[] data = ReadSRAMWithHexForm(startAddress, length);
+            if (data == null)
+            {
+                MessageBox.Show("데이터 읽기에 실패했습니다.", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            using (var hexForm = new HexWriteForm((int)length, data))
+            {
+                hexForm.Text = $"SRAM Read Result (Addr: 0x{startAddress:X4}, Len: {length})";
+                hexForm.SetReadOnlyMode();
+                hexForm.ShowDialog(Parent);
+            }
+        }
+
+        /// <summary>
+        /// HexWriteForm에서 받은 대량의 LED 데이터를 칩의 프로토콜에 맞게 전송합니다.
+        /// </summary>
+        /// <param name="length">전송할 총 바이트 수</param>
+        /// <param name="hexData">실제 데이터 배열</param>
+        public void WriteLEDDataWithHexForm(uint length, byte[] hexData)
+        {
+            if (length == 0) return;
+            if (length > 320) length = 320;
+            if (hexData == null || hexData.Length < length) return;
+
+            // 1. 데이터 쓰기 시작 명령어 전송 (CMD: 0x02)
+            byte[] bytes = new byte[4];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0x02;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            SPI.WriteBytes(bytes, 4, true);
+
+            // 2. 실제 데이터와 체크섬을 포함한 패킷 생성 및 전송
+            bytes = new byte[length + 1];
+            Array.Copy(hexData, 0, bytes, 0, length);
+
+            byte cksum = 0;
+            for (int i = 0; i < length; i++) cksum += bytes[i];
+            bytes[bytes.Length - 1] = cksum;
+
+            SPI.WriteBytesForChicago(bytes, bytes.Length, true);
+        }
+
+        /// <summary>
+        /// HexWriteForm에서 받은 대량의 데이터를 칩의 프로토콜에 맞게 SRAM으로 전송합니다.
+        /// </summary>
+        /// <param name="Address">쓰기를 시작할 SRAM 주소</param>
+        /// <param name="hexData">실제 데이터 배열</param>
+        public void WriteSRAMWithHexForm(uint Address, byte[] hexData)
+        {
+            uint length = 320; // SRAM 쓰기는 320바이트로 고정
+            if (hexData == null || hexData.Length < length) return;
+
+            byte[] bytes;
+
+            // 1. 주소 설정 (CMD: 0xC0)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC0;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            bytes[4] = (byte)((Address >> 8) & 0xFF);
+            bytes[5] = (byte)((Address >> 0) & 0xFF);
+            bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF);
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 2. 데이터 길이 설정 (CMD: 0xC1)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC1;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            bytes[4] = (byte)((length >> 8) & 0xFF);
+            bytes[5] = (byte)((length >> 0) & 0xFF);
+            bytes[6] = (byte)((bytes[4] + bytes[5]) & 0xFF);
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 3. 데이터 쓰기 명령어 전송 (CMD: 0xC2)
+            bytes = new byte[4];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC2;
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            SPI.WriteBytes(bytes, 4, true);
+
+            // 4. 실제 데이터와 체크섬 전송
+            bytes = new byte[length + 1];
+            Array.Copy(hexData, 0, bytes, 0, length);
+            byte cksum = 0;
+            for (int i = 0; i < length; i++) cksum += bytes[i];
+            bytes[bytes.Length - 1] = cksum;
+            SPI.WriteBytesForChicago(bytes, bytes.Length, true);
+        }
+
+        /// <summary>
+        /// 지정된 주소에서 지정된 길이만큼의 SRAM 데이터를 읽어옵니다.
+        /// </summary>
+        /// <param name="startAddress">읽기 시작 주소</param>
+        /// <param name="length">읽어올 바이트 수</param>
+        /// <returns>읽어온 데이터 배열</returns>
+        private byte[] ReadSRAMWithHexForm(uint startAddress, uint length)
+        {
+            if (length == 0 || length > 320) return null;
+
+            byte[] bytes;
+            uint cksum;
+
+            // 1. 주소 설정 (CMD: 0xC0)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC0;
+            cksum = (uint)(bytes[0] + bytes[1] + bytes[2]);
+            bytes[3] = (byte)(cksum & 0xFF);
+            bytes[4] = (byte)((startAddress >> 8) & 0xFF);
+            bytes[5] = (byte)(startAddress & 0xFF);
+            cksum = (uint)(bytes[4] + bytes[5]);
+            bytes[6] = (byte)(cksum & 0xFF);
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 2. 길이 설정 (CMD: 0xC1)
+            bytes = new byte[7];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC1;
+            cksum = (uint)(bytes[0] + bytes[1] + bytes[2]);
+            bytes[3] = (byte)(cksum & 0xFF);
+            bytes[4] = (byte)((length >> 8) & 0xFF);
+            bytes[5] = (byte)(length & 0xFF);
+            cksum = (uint)(bytes[4] + bytes[5]);
+            bytes[6] = (byte)(cksum & 0xFF);
+            SPI.WriteBytes(bytes, 7, true);
+
+            // 3. 데이터 읽기 (CMD: 0xC3)
+            bytes = new byte[4];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = 0xC3;
+            cksum = (uint)(bytes[0] + bytes[1] + bytes[2]);
+            bytes[3] = (byte)(cksum & 0xFF);
+
+            byte[] rx = SPI.WriteAndReadBytesForChicago(bytes, 4, (int)(length + 1));
+            if (rx == null || rx.Length < length) return null;
+
+            byte[] payload = new byte[length];
+            Array.Copy(rx, 0, payload, 0, length);
+            return payload;
+        }
+
+        /// <summary>
+        /// 칩에 특정 동작을 수행하도록 명령어를 전송합니다. (예: 리셋, 슬립 모드)
+        /// </summary>
+        /// <param name="cmd">전송할 명령어 코드</param>
+        private void WriteCommand(uint cmd)
+        {
+            byte[] bytes = new byte[4];
+            bytes[0] = 0x5A; bytes[1] = 0xFF; bytes[2] = (byte)(cmd & 0xff);
+            bytes[3] = (byte)((bytes[0] + bytes[1] + bytes[2]) & 0xFF);
+            SPI.WriteBytesForChicago(bytes, 4, true);
+        }
+
+        /// <summary>
+        /// Excel 데이터를 파싱하여 RegisterGroup 객체로 변환합니다.
+        /// </summary>
+        public override JLcLib.Chip.RegisterGroup MakeRegisterGroup(string GroupName, string[,] RegData)
+        {
+            JLcLib.Chip.RegisterGroup rg = new JLcLib.Chip.RegisterGroup(GroupName, WriteRegister, ReadRegister);
+
+            for (int xStart = 0; xStart < 3; xStart++)
+            {
+                for (int Row = 0; Row < RegData.GetLength(0); Row++)
+                {
+                    if ((RegData[Row, xStart] == "Bit") && (Row + 2 < RegData.GetLength(0)) && (RegData[Row + 1, xStart] == "Name") && (RegData[Row + 2, xStart] == "Default"))
+                    {
+                        string RegName = null;
+                        uint Address = 0;
+
+                        string StrAddr = RegData[Row - 1, xStart + 1];
+                        if (StrAddr != null && StrAddr.StartsWith("0x"))
+                            StrAddr = StrAddr.Substring(2);
+
+                        if (uint.TryParse(StrAddr, System.Globalization.NumberStyles.HexNumber, null, out Address))
+                        {
+                            RegName = RegData[Row - 1, xStart + 2];
+                            JLcLib.Chip.Register reg = rg.Registers.Add(RegName, Address);
+
+                            for (int Column = xStart + 1; Column < RegData.GetLength(1); Column++)
+                            {
+                                if (!((RegData[Row + 2, Column] == "X") || (RegData[Row + 2, Column] == "-") || (RegData[Row + 2, Column] == null) || (RegData[Row + 1, Column] == null)))
+                                {
+                                    string ItemName = null, ItemDesc = null;
+                                    int UpperBit = 0, LowerBit = 0;
+                                    uint ItemValue = 0;
+
+                                    ItemName = RegData[Row + 1, Column];
+                                    UpperBit = int.Parse(RegData[Row, Column]);
+                                    LowerBit = int.Parse(RegData[Row, Column]);
+                                    ItemValue = (uint)((RegData[Row + 2, Column] == "0") ? 0 : 1);
+
+                                    for (int x = Column + 1; x < RegData.GetLength(1); x++)
+                                    {
+                                        if (RegData[Row + 1, x] == null)
+                                        {
+                                            if (RegData[Row, x] != null)
+                                            {
+                                                LowerBit = int.Parse(RegData[Row, x]);
+                                                ItemValue = (ItemValue << 1) | (uint)((RegData[Row + 2, x] == "0") ? 0 : 1);
+                                            }
+                                        }
+                                        else break;
+                                    }
+
+                                    for (int y = Row; y < RegData.GetLength(0); y++)
+                                    {
+                                        if (RegData[y, xStart] == ItemName)
+                                        {
+                                            ItemDesc = RegData[y, xStart + 1];
+                                        }
+                                    }
+                                    reg.Items.Add(ItemName, UpperBit, LowerBit, ItemValue, ItemDesc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return rg;
+        }
+
+        /// <summary>
+        /// Chicago 칩에 특화된 UI를 설정합니다.
+        /// </summary>
+        public override void SetChipSpecificUI()
+        {
+            Parent.ChipCtrlButtons[0].Text = "TEST";
+            Parent.ChipCtrlButtons[0].Visible = true;
+            Parent.ChipCtrlButtons[0].Click += TEST;
+
+            Parent.ChipCtrlButtons[1].Text = "MANUAL";
+            Parent.ChipCtrlButtons[1].Visible = true;
+            Parent.ChipCtrlButtons[1].Click += Change_To_Manual_Test_Items;
+
+            Parent.ChipCtrlButtons[2].Text = "AUTO";
+            Parent.ChipCtrlButtons[2].Visible = true;
+            Parent.ChipCtrlButtons[2].Click += Change_To_Auto_Test_Items;
+
+            Parent.ChipCtrlButtons[3].Text = "CMD";
+            Parent.ChipCtrlButtons[3].Visible = true;
+            Parent.ChipCtrlButtons[3].Click += Change_To_CMD_Test_Items;
+        }
+
+        private void TEST(object sender, EventArgs e)
+        {
+            // 테스트용 메서드
+        }
+
+        private void SerialConnect_Click(object sender, EventArgs e)
+        {
+            Button b = sender as Button;
+            if (Serial.IsOpen == false)
+            {
+                Serial.Open();
+                if (Serial.IsOpen)
+                {
+                    b.Text = "Disconn";
+                    Parent.ChipCtrlTextboxes[0].Text = Serial.Config.PortName + "-" + Serial.Config.BaudRate.ToString();
+                }
+            }
+            else
+            {
+                Serial.Close();
+                if (!Serial.IsOpen)
+                    b.Text = "Connect";
+            }
+        }
+
+        private void SerialSetting_Click(object sender, EventArgs e)
+        {
+            JLcLib.Comn.WireComnForm.Show(Serial);
+            Serial.WriteSettingFile(Parent.IniFile, "Chicago");
+        }
+
+        private void Change_To_Manual_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.MANUAL;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_MANUAL.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_MANUAL)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        private void Change_To_Auto_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.AUTO;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_AUTO.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_AUTO)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        private void Change_To_CMD_Test_Items(object sender, EventArgs e)
+        {
+            CombBox_Item = COMBOBOX_ITEMS.CMD;
+            ComboBox_TestItems.Items.Clear();
+            for (int i = 0; i < (int)TEST_ITEMS_CMD.NUM_TEST_ITEMS; i++)
+                ComboBox_TestItems.Items.Add(((TEST_ITEMS_CMD)i).ToString());
+            ComboBox_TestItems.SelectedIndex = 0;
+        }
+
+        public override bool CheckConnectionForLog()
+        {
+            return ((Serial != null) && Serial.IsOpen);
+        }
+
+        public override void RunLog()
+        {
+            if (Serial.IsOpen && (Serial.RcvQueue.Count != 0))
+            {
+                for (int i = 0; i < Serial.RcvQueue.Count; i++)
+                {
+                    byte b = Serial.RcvQueue.Get();
+                    if ((b > 0x00 && b < 0x80) && b != '\0')
+                    {
+                        LogMessage += (char)b;
+                        if (b == '\n')
+                        {
+                            Log.WriteWithElapsedTime(LogMessage);
+                            Log.WriteLine("\n");
+                            LogMessage = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        public override void SendCommand(string Command)
+        {
+            Command += "\r\n";
+            byte[] Var = Encoding.ASCII.GetBytes(Command);
+            Serial.WriteBytes(Var, Var.Length, true);
+        }
+
+        /// <summary>
+        /// 'Run Test' 버튼 클릭 시 호출되는 메인 테스트 함수입니다.
+        /// </summary>
+        public override void RunTest(int TestItemIndex, string Arg)
+        {
+            uint iVal;
+            try
+            {
+                // 16진수 문자열(예: "400")을 uint로 변환 시도
+                iVal = System.Convert.ToUInt32(Arg, 16);
+            }
+            catch
+            {
+                iVal = 0;
+            }
+
+            switch (CombBox_Item)
+            {
+                case COMBOBOX_ITEMS.MANUAL:
+                    switch ((TEST_ITEMS_MANUAL)TestItemIndex)
+                    {
+                        case TEST_ITEMS_MANUAL.Write_SRAM:
+                            RunSRAMWrite(iVal);
+                            break;
+                        case TEST_ITEMS_MANUAL.Read_SRAM:
+                            RunSRAMRead(iVal);
+                            break;
+                        case TEST_ITEMS_MANUAL.WaveEffect_Start: RunWaveEffectTest(); break;
+                        case TEST_ITEMS_MANUAL.ScrollText_Start: RunScrollTextTest(); break;
+                        case TEST_ITEMS_MANUAL.BreathingEffect_Start: RunBreathingEffectTest(); break;
+                        case TEST_ITEMS_MANUAL.ClockEffect_Start: RunClockEffectTest(); break;
+                        case TEST_ITEMS_MANUAL.LED_Effect_Stop: StopLEDMatrixEffect(); break;
+                        default:
+                            break;
+                    }
+                    break;
+                case COMBOBOX_ITEMS.AUTO:
+                    switch ((TEST_ITEMS_AUTO)TestItemIndex)
+                    {
+
+                    }
+                    break;
+                case COMBOBOX_ITEMS.CMD:
+                    switch ((TEST_ITEMS_CMD)TestItemIndex)
+                    {
+                        case TEST_ITEMS_CMD.UpdateDisplay: 
+                            WriteCommand(0x04); 
+                            break;
+                        case TEST_ITEMS_CMD.TurnOffDisplay: 
+                            WriteCommand(0x08); 
+                            break;
+                        case TEST_ITEMS_CMD.WakeUp: 
+                            WriteCommand(0x0D); 
+                            break;
+                        case TEST_ITEMS_CMD.Sleep: 
+                            WriteCommand(0x0E); 
+                            break;
+                        case TEST_ITEMS_CMD.Reset: 
+                            WriteCommand(0xCE); 
+                            break;
+                        case TEST_ITEMS_CMD.WriteDisplay:
+                            RunWriteLEDData();
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        #region Function for Chip Test
+        /// <summary>
+        /// 'WaveEffect' 테스트를 실행합니다. 파도 애니메이션을 생성하여 LED 매트릭스에 표시합니다.
+        /// </summary>
+        public void RunWaveEffectTest()
+        {
+            if (animationWorker != null && animationWorker.IsBusy)
+            {
+                Log.WriteLine("Another animation is already running.", Color.OrangeRed, Parent.BackColor);
+                return;
+            }
+
+            int totalBytes = CalculateChicagoGridSizeBytes();
+            if (totalBytes == 0)
+            {
+                MessageBox.Show("계산된 LED 개수가 0입니다. 칩 설정을 확인하세요.", "알림", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            animationWorker = new BackgroundWorker();
+            animationWorker.WorkerSupportsCancellation = true;
+
+            animationWorker.DoWork += (sender, e) =>
+            {
+                BackgroundWorker worker = sender as BackgroundWorker;
+                byte[] ledData = new byte[totalBytes];
+                int frame = 0;
+
+                while (!worker.CancellationPending)
+                {
+                    for (int i = 0; i < totalBytes; i++)
+                    {
+                        int r = i / 32;
+                        int c = i % 32;
+
+                        double sinInput = (c + r + frame) * 0.075;
+                        double sinOutput = Math.Sin(sinInput);
+                        byte brightness = (byte)(255 - (((sinOutput + 1.0) / 2.0) * 255));
+                        if (brightness < 3) brightness = 3;
+
+                        int led_index = r * 32 + (31 - c);
+                        if (led_index < totalBytes)
+                        {
+                            ledData[led_index] = brightness;
+                        }
+                    }
+
+                    WriteLEDDataWithHexForm((uint)totalBytes, ledData);
+                    WriteCommand(0x04);
+
+                    Thread.Sleep(20);
+                    frame++;
+                }
+            };
+
+            animationWorker.RunWorkerCompleted += (sender, e) =>
+            {
+                WriteCommand(0x08);
+                Log.WriteLine("Wave effect stopped.", Color.Green, Parent.BackColor);
+            };
+
+            animationWorker.RunWorkerAsync();
+            Log.WriteLine("Wave effect started.", Color.Green, Parent.BackColor);
+        }
+
+        /// <summary>
+        /// 문자 스크롤 애니메이션을 비동기적으로 시작합니다.
+        /// </summary>
+        public void RunScrollTextTest()
+        {
+            if (animationWorker != null && animationWorker.IsBusy)
+            {
+                Log.WriteLine("Another animation is already running.", Color.OrangeRed, Parent.BackColor);
+                return;
+            }
+
+            DialogResult result = MessageBox.Show("배경을 켜시겠습니까?\n(아니오: 글자 켜기)", "텍스트 표시 방식 선택", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            bool invertDisplay = (result == DialogResult.Yes);
+
+            string inputText = RegContForm.Prompt.ShowDialog("스크롤할 문자를 입력하세요 (최대 20글자):", "Scroll Text");
+            if (string.IsNullOrWhiteSpace(inputText)) return;
+
+            if (inputText.Length > 20)
+            {
+                MessageBox.Show("최대 20글자까지만 입력할 수 있습니다.", "입력 오류", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            inputText = inputText.ToUpper();
+
+            List<byte> scrollBuffer = new List<byte>();
+            foreach (char ch in inputText)
+            {
+                if (Font.ContainsKey(ch))
+                {
+                    scrollBuffer.AddRange(Font[ch]);
+
+                    if (ch != ' ')
+                    {
+                        scrollBuffer.Add(0x00);
+                    }
+                }
+            }
+            if (scrollBuffer.Count == 0) return;
+
+            for (int i = 0; i < 32; i++)
+            {
+                scrollBuffer.Add(0x00);
+            }
+
+            animationWorker = new BackgroundWorker();
+            animationWorker.WorkerSupportsCancellation = true;
+
+            animationWorker.DoWork += (sender, e) =>
+            {
+                BackgroundWorker worker = sender as BackgroundWorker;
+                int totalBytes = 320;
+                byte[] ledData = new byte[totalBytes];
+                int frame = 0;
+
+                while (!worker.CancellationPending)
+                {
+                    for (int grid_col = 0; grid_col < 32; grid_col++)
+                    {
+                        int buffer_index = (grid_col + frame) % scrollBuffer.Count;
+                        byte columnData = scrollBuffer[buffer_index];
+
+                        for (int grid_row = 0; grid_row < 10; grid_row++)
+                        {
+                            int led_index = grid_row * 32 + (31 - grid_col);
+
+                            if (grid_row > 0 && grid_row < 9)
+                            {
+                                bool isPixelOn = ((columnData >> (grid_row - 1)) & 0x01) == 1;
+
+                                if (invertDisplay) // 배경 켜기 모드
+                                {
+                                    ledData[led_index] = isPixelOn ? (byte)0 : (byte)255;
+                                }
+                                else // 글자 켜기 모드
+                                {
+                                    ledData[led_index] = isPixelOn ? (byte)255 : (byte)0;
+                                }
+                            }
+                            else
+                            {
+                                ledData[led_index] = invertDisplay ? (byte)255 : (byte)0;
+                            }
+                        }
+                    }
+
+                    WriteLEDDataWithHexForm((uint)totalBytes, ledData);
+                    WriteCommand(0x04);
+
+                    Thread.Sleep(50);
+                    frame++;
+                }
+            };
+
+            animationWorker.RunWorkerCompleted += (sender, e) =>
+            {
+                WriteCommand(0x08);
+                Log.WriteLine("Scroll text stopped.", Color.Green, Parent.BackColor);
+            };
+
+            animationWorker.RunWorkerAsync();
+            Log.WriteLine("Scroll text started.", Color.Green, Parent.BackColor);
+        }
+
+        public void RunBreathingEffectTest()
+        {
+            if (animationWorker != null && animationWorker.IsBusy)
+            {
+                Log.WriteLine("Another animation is already running.", Color.OrangeRed, Parent.BackColor);
+                return;
+            }
+
+            int totalBytes = CalculateChicagoGridSizeBytes();
+            if (totalBytes == 0)
+            {
+                MessageBox.Show("계산된 LED 개수가 0입니다. 칩 설정을 확인하세요.", "알림", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            animationWorker = new BackgroundWorker();
+            animationWorker.WorkerSupportsCancellation = true;
+
+            animationWorker.DoWork += (sender, e) =>
+            {
+                BackgroundWorker worker = sender as BackgroundWorker;
+                byte[] ledData = new byte[totalBytes];
+                uint frame = 0; // uint로 변경하여 오버플로우 시 자연스럽게 순환하도록 함
+
+                while (!worker.CancellationPending)
+                {
+                    // 1. 시간에만 의존하는 사인 함수로 단일 밝기 값 계산
+                    // 0.05는 숨쉬기 속도를 조절하는 계수 (작을수록 느려짐)
+                    double sinInput = frame * 0.05;
+                    double sinOutput = Math.Sin(sinInput);
+                    byte brightness = (byte)(((sinOutput + 1.0) / 2.0) * 255);
+
+                    // 2. 모든 LED에 동일한 밝기 값 적용
+                    for (int i = 0; i < totalBytes; i++)
+                    {
+                        ledData[i] = brightness;
+                    }
+
+                    // 3. 데이터 전송 및 화면 업데이트
+                    WriteLEDDataWithHexForm((uint)totalBytes, ledData);
+                    WriteCommand(0x04);
+
+                    Thread.Sleep(10); // 애니메이션 속도 조절
+                    frame++;
+                }
+            };
+
+            animationWorker.RunWorkerCompleted += (sender, e) =>
+            {
+                WriteCommand(0x08); // TurnOffDisplay
+                Log.WriteLine("Breathing effect stopped.", Color.Green, Parent.BackColor);
+            };
+
+            animationWorker.RunWorkerAsync();
+            Log.WriteLine("Breathing effect started.", Color.Green, Parent.BackColor);
+        }
+
+        public void RunClockEffectTest()
+        {
+            if (animationWorker != null && animationWorker.IsBusy)
+            {
+                Log.WriteLine("Another animation is already running.", Color.OrangeRed, Parent.BackColor);
+                return;
+            }
+
+            animationWorker = new BackgroundWorker();
+            animationWorker.WorkerSupportsCancellation = true;
+
+            animationWorker.DoWork += (sender, e) =>
+            {
+                BackgroundWorker worker = sender as BackgroundWorker;
+                int totalBytes = 320; // 10x32 그리드 전체 사용
+                byte[] ledData = new byte[totalBytes];
+
+                while (!worker.CancellationPending)
+                {
+                    // 1. 현재 시간을 HH:mm 형식의 문자열로 가져오기
+                    string timeString = DateTime.Now.ToString("HH:mm");
+                    bool showColon = (DateTime.Now.Second % 2 == 0); // 초가 짝수일 때만 콜론 표시
+
+                    // 2. 시간 문자열을 픽셀 데이터 띠(textBuffer)로 변환
+                    List<byte> textBuffer = new List<byte>();
+                    foreach (char ch in timeString)
+                    {
+                        char charToRender = ch;
+                        // 콜론 깜빡임 로직
+                        if (ch == ':' && !showColon)
+                        {
+                            charToRender = ' '; // 홀수 초에는 공백으로 대체
+                        }
+
+                        if (Font.ContainsKey(charToRender))
+                        {
+                            textBuffer.AddRange(Font[charToRender]);
+                            textBuffer.Add(0x00); // 글자 사이 1픽셀 공백
+                        }
+                    }
+
+                    // 3. 픽셀 데이터를 LED 매트릭스 중앙에 배치
+                    int textWidth = textBuffer.Count;
+                    int startCol = (32 - textWidth) / 2; // 중앙 정렬을 위한 시작 열 계산
+                    Array.Clear(ledData, 0, ledData.Length); // LED 데이터 버퍼 초기화
+
+                    for (int c = 0; c < textWidth; c++)
+                    {
+                        int physical_col = startCol + c;
+                        if (physical_col < 0 || physical_col >= 32) continue;
+
+                        byte columnData = textBuffer[c];
+
+                        for (int grid_row = 0; grid_row < 10; grid_row++)
+                        {
+                            int led_index = grid_row * 32 + (31 - physical_col);
+
+                            if (((columnData >> (grid_row - 1)) & 0x01) == 1)
+                            {
+                                ledData[led_index] = 255;
+                            }
+                        }
+                    }
+
+                    // 4. 데이터 전송 및 화면 업데이트
+                    WriteLEDDataWithHexForm((uint)totalBytes, ledData);
+                    WriteCommand(0x04);
+
+                    // 1초마다 업데이트 되도록 남은 시간만큼 대기
+                    Thread.Sleep(1000 - DateTime.Now.Millisecond);
+                }
+            };
+
+            animationWorker.RunWorkerCompleted += (sender, e) =>
+            {
+                WriteCommand(0x08); // TurnOffDisplay
+                Log.WriteLine("Clock effect stopped.", Color.Green, Parent.BackColor);
+            };
+
+            animationWorker.RunWorkerAsync();
+            Log.WriteLine("Clock effect started.", Color.Green, Parent.BackColor);
+        }
+
+        /// <summary>
+        /// 실행 중인 LED 매트릭스 애니메이션을 중지합니다.
+        /// </summary>
+        public void StopLEDMatrixEffect()
+        {
+            if (animationWorker != null && animationWorker.IsBusy)
+            {
+                animationWorker.CancelAsync();
+            }
+            else
+            {
+                Log.WriteLine("No effect is currently running.", Color.OrangeRed, Parent.BackColor);
+            }
+        }
+        #endregion
+    }
+}
